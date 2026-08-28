@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__
 from .config import settings
 from .database import close_pool, fetch_all, fetch_one, init_pool
+from .integrations import router as geovision_router
 from .routes import (collection_events, evidence, evidence_clips, gis_routes, properties,
                      property_registry)
 from .survey import router as survey_router
@@ -100,6 +101,9 @@ app.include_router(collection_events.router)
 app.include_router(evidence.router)
 app.include_router(evidence_clips.router)
 app.include_router(survey_router)
+# Inbound edge observations. Registered after the property/GIS routers on
+# purpose: it owns its own /integrations prefix and must never shadow them.
+app.include_router(geovision_router)
 if vision_router is not None:
     app.include_router(vision_router)
 

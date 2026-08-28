@@ -170,6 +170,20 @@ class Settings:
     VISION_STREAM_ENABLED = _b("VISION_STREAM_ENABLED", True)
     VISION_JPEG_QUALITY = _i("VISION_JPEG_QUALITY", 70)
 
+    # --- GeoVision edge ingestion -----------------------------------------
+    # The Windows RealSense/RFID laptop POSTs observations to
+    # /integrations/geovision/events. Perception only: these settings tune
+    # how the status endpoint reads, never how a property is decided.
+    GEOVISION_ENABLED = _b("GEOVISION_ENABLED", True)
+    # A camera track older than this is no longer "active". The edge
+    # publishes at ~5 Hz per track, so anything beyond a few seconds of
+    # silence means the person left frame or the stream stopped.
+    GEOVISION_TRACK_STALE_S = _f("GEOVISION_TRACK_STALE_S", 15.0)
+    # A source that has said nothing for this long is treated as offline.
+    # Generous: HEARTBEAT is optional and off by default on the edge, so a
+    # busy device may only be heard from via TRACK_UPDATE.
+    GEOVISION_DEVICE_STALE_S = _f("GEOVISION_DEVICE_STALE_S", 60.0)
+
     # --- LangSmith tracing (optional, OFF by default) ----------------------
     # Records the association decision tree - request -> lookup -> the
     # individual PostGIS queries - as one run per request. See
@@ -191,7 +205,7 @@ class Settings:
     LANGSMITH_TRACE_EXCLUDE = tuple(
         s.strip() for s in os.getenv(
             "LANGSMITH_TRACE_EXCLUDE",
-            "/assets,/vision/stream,/vision/tracks,/vision/status,/health,/favicon.ico",
+            "/assets,/vision/stream,/vision/tracks,/vision/status,/health,/favicon.ico,/integrations/geovision/events",
         ).split(",") if s.strip()
     )
 
