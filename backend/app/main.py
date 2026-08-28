@@ -16,9 +16,10 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__
 from .config import settings
 from .database import close_pool, fetch_all, fetch_one, init_pool
-from .routes import (collection_events, evidence, gis_routes, properties,
+from .routes import (collection_events, evidence, evidence_clips, gis_routes, properties,
                      property_registry)
 from .survey import router as survey_router
+from .tracing import LangSmithTraceMiddleware, tracing_enabled, tracing_status
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -41,6 +42,15 @@ except Exception as _exc:  # noqa: BLE001  pragma: no cover
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_pool()
+    if tracing_enabled():
+        # One line, at start-up, so nobody has to guess whether the run they
+        # are looking for was ever recorded.
+        _t = tracing_status()
+        print(
+            f"[tracing] LangSmith project={_t['project']!r} "
+            f"sending={_t['enabled']} sql_spans={_t['sql_spans']}"
+            + ("" if _t["enabled"] else f" - {_t['reason']}")
+        )
     if vision_router is not None:
         # No-op unless VISION_AUTOSTART is set. Off by default: the camera is
         # started by the picker-tracking page, not by running the backend.
@@ -63,6 +73,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# LangSmith request tracing. Added BEFORE the CORS middleware on purpose:
+# Starlette applies the last-added middleware outermost, so this ordering
+# leaves CORS on the outside, where it answers preflight OPTIONS itself and
+# those never reach the tracer. Registered unconditionally - the middleware
+# checks `tracing_enabled()` per request and, when tracing is off, passes the
+# call straight through with one boolean test.
+app.add_middleware(LangSmithTraceMiddleware)
+
 # Demo only: the dashboard is served from the same origin, but this keeps
 # local tooling (QGIS plugins, a separate front-end port) painless.
 app.add_middleware(
@@ -80,12 +98,25 @@ app.include_router(properties.router)
 app.include_router(gis_routes.router)
 app.include_router(collection_events.router)
 app.include_router(evidence.router)
+app.include_router(evidence_clips.router)
 app.include_router(survey_router)
 if vision_router is not None:
     app.include_router(vision_router)
 
 # shared css/js for both dashboards
 app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
+
+# Rolling video-evidence clips. Mounted at /evidence-files, not /evidence:
+# fake_evidence_path() already produces /evidence/... strings for the demo
+# rows, and GET /evidence is the database listing.
+try:
+    from .evidence_buffer import EVIDENCE_DIR as _EVIDENCE_DIR
+
+    Path(_EVIDENCE_DIR).mkdir(parents=True, exist_ok=True)
+    app.mount("/evidence-files", StaticFiles(directory=_EVIDENCE_DIR),
+              name="evidence_files")
+except Exception as _evidence_error:  # noqa: BLE001
+    print("!! Evidence clip directory not mounted:", repr(_evidence_error))
 
 
 @app.get("/", tags=["health"])
@@ -107,6 +138,17 @@ def health_vision():
         return {"status": "unavailable", "import_error": VISION_IMPORT_ERROR}
     from .vision.pipeline import pipeline as _p
     return {"status": "ok", **_p.status()}
+
+
+@app.get("/health/tracing", tags=["health"])
+def health_tracing():
+    """Whether LangSmith tracing is on, and if not, why not.
+
+    Same reasoning as /health/vision: "off" and "misconfigured" look identical
+    from the outside otherwise, and an observability layer that silently
+    records nothing is worse than one that is plainly switched off.
+    """
+    return tracing_status()
 
 
 @app.get("/health/db", tags=["health"])

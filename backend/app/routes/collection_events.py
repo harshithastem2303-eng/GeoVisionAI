@@ -6,12 +6,21 @@ from ..config import settings
 from ..database import execute, fetch_all, fetch_one
 from ..gis import lookup_property
 from ..models import fake_evidence_path, next_event_id, next_evidence_id
+from ..tracing import annotate_run
 from ..schemas import (
     CollectionEventCreate,
     CollectionEventOut,
     CollectionEventWithEvidence,
     NonSegregationRequest,
 )
+
+# Rolling video evidence. Optional -- a failure here must not stop the
+# status write, which is the operation the demo depends on.
+try:
+    from ..evidence_buffer import evidence_recorder
+except Exception as _evidence_error:  # noqa: BLE001
+    evidence_recorder = None
+    print("!! Evidence buffer unavailable:", repr(_evidence_error))
 
 router = APIRouter(prefix="/collection-events", tags=["collection-events"])
 
@@ -154,6 +163,17 @@ def create_event(req: CollectionEventCreate):
             "review_status": review_status,
         },
     )
+    # Label the trace with the identifiers a dispute would arrive quoting.
+    # No-op when tracing is off.
+    annotate_run(
+        event_id=event_id,
+        property_id=property_id,
+        picker_id=req.picker_id,
+        segregation_status=req.segregation_status,
+        association_confidence=confidence,
+        review_status=review_status,
+        associated_by="lookup" if req.property_id is None else "caller",
+    )
     return row
 
 
@@ -219,7 +239,55 @@ def mark_non_segregated(event_id: str, req: NonSegregationRequest):
             ),
         )
 
+    # -----------------------------------------------------------------
+    # VIDEO EVIDENCE
+    #
+    # Freeze the rolling camera buffer and save the ~15 s around this
+    # decision. trigger() returns in about a millisecond; the MP4 is
+    # encoded on a worker thread and lands ~3 s later (the post-roll), so
+    # the row's file_path is written before the file exists. That is what
+    # verified=FALSE already means here.
+    #
+    # This is ADDITIVE: the NON_SEGREGATION_PROOF row above is unchanged,
+    # and the clip is a second row of type VIDEO_CLIP.
+    # -----------------------------------------------------------------
+    clip = None
+    if req.capture_video and evidence_recorder is not None:
+        try:
+            clip = evidence_recorder.trigger(
+                property_id=updated.get("property_id"),
+                picker_id=picker_id,
+                event_type="NOT_SEGREGATED",
+                extra={"event_id": event_id, "note": req.note},
+            )
+        except Exception as exc:  # noqa: BLE001
+            clip = {"status": "FAILED", "error": repr(exc)}
+
+        if clip.get("status") != "FAILED":
+            execute(
+                """
+                INSERT INTO evidence (evidence_id, event_id, evidence_type, file_path, captured_at, verified)
+                VALUES (%s, %s, %s, %s, %s, FALSE)
+                """,
+                (
+                    next_evidence_id(),
+                    event_id,
+                    "VIDEO_CLIP",
+                    clip["video_path"],
+                    datetime.now(timezone.utc),
+                ),
+            )
+
     updated["evidence"] = fetch_all(
         "SELECT * FROM evidence WHERE event_id = %s ORDER BY captured_at", (event_id,)
+    )
+    annotate_run(
+        event_id=event_id,
+        property_id=updated.get("property_id"),
+        picker_id=picker_id,
+        action="mark_non_segregated",
+        rfid_uid=req.rfid_uid,
+        evidence_created=bool(req.create_evidence),
+        evidence_clip=(clip or {}).get("evidence_id"),
     )
     return updated

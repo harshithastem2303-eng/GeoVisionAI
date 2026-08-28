@@ -33,6 +33,7 @@ from typing import Any
 
 from .config import settings
 from .database import fetch_all, fetch_one
+from .tracing import traceable
 
 # ---------------------------------------------------------------------------
 # 1 + 2: containment
@@ -125,8 +126,17 @@ def _as_candidate(row: dict) -> dict:
     }
 
 
+@traceable(run_type="chain", name="gis.lookup_property")
 def lookup_property(lat: float, lon: float, radius_m: float | None = None) -> dict:
-    """Associate a picker coordinate with a property. Never guesses silently."""
+    """Associate a picker coordinate with a property. Never guesses silently.
+
+    Traced (when tracing is on) because this is THE decision the whole system
+    exists to defend. The span records the coordinate that went in and the
+    full result that came out - decision, confidence, method, the stated
+    reason, and every candidate zone that was considered including the ones
+    that lost. A refusal is as much of a result as an association, and both
+    land in the same place.
+    """
     radius = radius_m if radius_m is not None else settings.SEARCH_RADIUS_M
     params = {"lat": lat, "lon": lon, "radius_m": radius}
 

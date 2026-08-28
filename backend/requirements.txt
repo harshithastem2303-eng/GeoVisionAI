@@ -33,3 +33,14 @@ python-multipart>=0.0.9,<1.0
 # geometry generation in scripts/generate_real_lane.py and
 # scripts/generate_survey_seed.py
 numpy>=1.26,<3.0
+
+# LangSmith run tracing for the association decision tree (backend/app/tracing.py).
+#
+# Pure Python, and its only real dependency - pydantic - is already here, so
+# it cannot repeat the psycopg-binary wheel problem described above. It is
+# also inert unless LANGSMITH_TRACING is set: with this installed and tracing
+# off, nothing imports differently and nothing is sent anywhere.
+#
+# There is no LLM in this backend. LangSmith is used purely as a run-tree
+# recorder, so no model-provider key is involved.
+langsmith>=0.1,<1.0

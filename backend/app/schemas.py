@@ -84,6 +84,10 @@ class NonSegregationRequest(BaseModel):
     rfid_uid: str | None = Field(None, description="RFID tag that raised the exception.")
     note: str | None = None
     create_evidence: bool = True
+    # Save the ~15 s of camera footage around the decision as an MP4 and
+    # link it as a VIDEO_CLIP evidence row. Silently skipped when the
+    # vision pipeline is not running.
+    capture_video: bool = True
     evidence_type: Literal[
         "NON_SEGREGATION_PROOF", "CAMERA_FRAME", "VIDEO_CLIP", "COLLECTION_PROOF"
     ] = "NON_SEGREGATION_PROOF"

@@ -1,1 +1,2 @@
-from . import collection_events, evidence, gis_routes, properties  # noqa: F401
+from . import (collection_events, evidence, evidence_clips,  # noqa: F401
+               gis_routes, properties)

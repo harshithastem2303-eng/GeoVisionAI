@@ -21,6 +21,7 @@ here, by design.
 from __future__ import annotations
 
 import atexit
+import gc
 import logging
 import os
 import threading
@@ -40,6 +41,21 @@ RUNNING = "RUNNING"
 NO_CAMERA = "NO_CAMERA"
 ERROR = "ERROR"
 DEGRADED = "DEGRADED"
+
+
+# ---------------------------------------------------------------------------
+# Rolling video evidence (optional).
+#
+# Imported defensively: a problem in the evidence module must never be able
+# to stop the camera thread. See app/evidence_buffer.py.
+# ---------------------------------------------------------------------------
+try:
+    from ..evidence_buffer import evidence_recorder
+except Exception as _evidence_error:  # noqa: BLE001
+    evidence_recorder = None
+    print("!! Evidence buffer unavailable:", repr(_evidence_error))
+
+EVIDENCE_CAMERA_ID = os.environ.get("EVIDENCE_CAMERA_ID", "vision-pipeline")
 
 
 class DependencyMissing(RuntimeError):
@@ -94,6 +110,81 @@ def enumerate_stream_profiles(rs, device) -> list[dict[str, Any]]:
             except Exception:  # noqa: BLE001
                 continue
     return out
+
+
+def profile_from_stream(rs, pipeline_profile, stream) -> dict[str, Any] | None:
+    """The profile the pipeline ACTUALLY negotiated, read after start().
+
+    Post-start introspection only. It reads the profile object start() already
+    returned, so it cannot contend for the device the way a pre-start sensor
+    sweep does.
+    """
+    try:
+        sp = pipeline_profile.get_stream(stream)
+        vsp = sp.as_video_stream_profile()
+        return {
+            "sensor": "(negotiated)",
+            "stream": str(sp.stream_type()).rsplit(".", 1)[-1].lower(),
+            "format": str(sp.format()).rsplit(".", 1)[-1].lower(),
+            "width": int(vsp.width()),
+            "height": int(vsp.height()),
+            "fps": int(sp.fps()),
+            "index": int(sp.stream_index()),
+        }
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def discover_device(rs, configured_serial: str = "") -> dict[str, Any]:
+    """Identity strings for the camera, with every handle released on return.
+
+    Deliberately touches NO sensors and NO stream profiles. A held-open
+    sensor/profile sweep is one of the two things the Mac/D455 diagnostic
+    proved will break the `pipeline.start()` that follows it; the other is
+    `can_resolve()`. Neither happens anywhere in the startup path any more.
+
+    Never silently picks a different camera: a configured serial that is not
+    present is an error, and so is more than one device with no serial set.
+    """
+    ctx = rs.context()
+    devices = list(ctx.query_devices())
+    try:
+        found: list[dict[str, Any]] = []
+        for dev in devices:
+            row: dict[str, Any] = {}
+            for attr, field in (("name", "name"),
+                                ("serial_number", "serial"),
+                                ("firmware_version", "firmware"),
+                                ("usb_type_descriptor", "usb_type")):
+                try:
+                    row[field] = dev.get_info(getattr(rs.camera_info, attr))
+                except Exception:  # noqa: BLE001
+                    row[field] = None
+            found.append(row)
+
+        if not found:
+            raise RuntimeError("no RealSense device found on USB")
+
+        serials = ", ".join(str(r.get("serial")) for r in found)
+        want = (configured_serial or "").strip()
+        if want:
+            for row in found:
+                if str(row.get("serial") or "") == want:
+                    return row
+            raise RuntimeError(
+                f"VISION_SERIAL={want} is not attached (found: {serials}). "
+                "Refusing to open a different camera.")
+
+        if len(found) > 1:
+            raise RuntimeError(
+                f"{len(found)} RealSense devices attached ({serials}); set "
+                "VISION_SERIAL to bind one. Refusing to guess.")
+
+        return found[0]
+    finally:
+        devices.clear()
+        del devices, ctx
+        gc.collect()
 
 
 def describe_profile(p: dict[str, Any] | None) -> str:
@@ -236,73 +327,72 @@ class RealSenseSource:
             ) from exc
 
         self._rs = rs
-        ctx = rs.context()
-        devices = list(ctx.query_devices())
-        if not devices:
-            raise RuntimeError("no RealSense device found on USB")
 
-        dev = devices[0]
-        for attr, field in (("name", "device_name"),
-                            ("serial_number", "serial"),
-                            ("firmware_version", "firmware"),
-                            ("usb_type_descriptor", "usb_type")):
-            try:
-                setattr(self, field, dev.get_info(getattr(rs.camera_info, attr)))
-            except Exception:  # noqa: BLE001
-                pass
+        # ------------------------------------------------------------------
+        # Startup sequence, exactly as proven on the Mac / D455 by
+        # scripts/diag_realsense_startup.py:
+        #
+        #   PASS   enable_device(serial)
+        #          + enable_stream(depth, 640, 480, z16, 15)
+        #          + pipeline.start(config)
+        #   FAIL   the same config once can_resolve() is called first
+        #   FAIL   the same config with a sensor/profile sweep held open
+        #
+        # So discovery is a separate step that releases every librealsense
+        # handle before returning, and nothing between it and start() touches
+        # the device. No can_resolve. No enumeration. No profile selection -
+        # what a device publishes is not what it will start, which is the
+        # whole reason the old path failed.
+        # ------------------------------------------------------------------
+        info = discover_device(rs, settings.VISION_SERIAL)
+        self.device_name = info.get("name")
+        self.serial = info.get("serial")
+        self.firmware = info.get("firmware")
+        self.usb_type = info.get("usb_type")
+        del info
+        gc.collect()
 
-        # A D455 negotiated down to USB 2.1 publishes a much smaller profile
-        # list and will not sustain dual 640x480@30. Worth saying out loud
-        # rather than letting it look like a mystery timeout.
+        if not self.serial:
+            raise RuntimeError(
+                "the camera reports no serial number, so it cannot be bound "
+                "explicitly; set VISION_SERIAL")
+
+        # A D455 negotiated down to USB 2.1 will not sustain dual 640x480@30.
+        # Worth saying out loud rather than letting it look like a mystery
+        # timeout.
         if self.usb_type and not str(self.usb_type).startswith("3"):
             log.warning("RealSense is on USB %s, not USB 3 - high frame rates "
                         "and dual streams may not be deliverable", self.usb_type)
 
-        self.available_profiles = enumerate_stream_profiles(rs, dev)
-
-        cfg = rs.config()
-        if self.serial:
-            cfg.enable_device(self.serial)
-
-        if self.enable_depth:
-            self.depth_profile = select_stream_profile(
-                self.available_profiles, "depth", self.width, self.height,
-                self.fps, DEPTH_FORMAT_PREFERENCE)
-            if self.depth_profile is None:
-                raise RuntimeError(
-                    "the device publishes no Z16 depth profile at all; "
-                    f"available depth profiles: {self.supported('depth') or 'none'}")
-            cfg.enable_stream(rs.stream.depth,
-                              self.depth_profile["width"], self.depth_profile["height"],
-                              getattr(rs.format, self.depth_profile["format"]),
-                              self.depth_profile["fps"])
-
-        if self.enable_color:
-            self.color_profile = select_stream_profile(
-                self.available_profiles, "color", self.width, self.height,
-                self.fps, COLOR_FORMAT_PREFERENCE)
-            if self.color_profile is None:
-                raise RuntimeError(
-                    "the device publishes no usable colour profile; "
-                    f"available colour profiles: {self.supported('color') or 'none'}")
-            cfg.enable_stream(rs.stream.color,
-                              self.color_profile["width"], self.color_profile["height"],
-                              getattr(rs.format, self.color_profile["format"]),
-                              self.color_profile["fps"])
+        # Nothing is enumerated, so there is nothing to report until start()
+        # answers.
+        self.available_profiles = []
+        self.depth_profile = None
+        self.color_profile = None
 
         self._pipeline = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_device(self.serial)          # explicit binding, always
 
-        # Resolve before start: this is where an impossible combination says
-        # so, instead of starting happily and then starving.
-        try:
-            if not cfg.can_resolve(rs.pipeline_wrapper(self._pipeline)):
-                raise RuntimeError(
-                    "librealsense cannot resolve this stream combination: "
-                    + self.profile_summary())
-        except AttributeError:  # older binding without can_resolve
-            pass
+        if self.enable_depth:
+            cfg.enable_stream(rs.stream.depth, self.width, self.height,
+                              rs.format.z16, self.fps)
+        if self.enable_color:
+            cfg.enable_stream(rs.stream.color, self.width, self.height,
+                              rs.format.bgr8, self.fps)
+
+        log.info("RealSense start: serial=%s depth=%s color=%s %dx%d @%d",
+                 self.serial, self.enable_depth, self.enable_color,
+                 self.width, self.height, self.fps)
 
         profile = self._pipeline.start(cfg)
+
+        # Post-start introspection: what was actually negotiated, read off the
+        # profile start() just returned. Cannot contend for the device.
+        if self.enable_depth:
+            self.depth_profile = profile_from_stream(rs, profile, rs.stream.depth)
+        if self.enable_color:
+            self.color_profile = profile_from_stream(rs, profile, rs.stream.color)
 
         if self.enable_depth:
             depth_sensor = profile.get_device().first_depth_sensor()
@@ -574,7 +664,10 @@ class VisionPipeline:
             if source is None:
                 try:
                     source = RealSenseSource(
-                        settings.VISION_WIDTH, settings.VISION_HEIGHT, settings.VISION_FPS)
+                        settings.VISION_WIDTH, settings.VISION_HEIGHT,
+                        settings.VISION_DEPTH_FPS,
+                        enable_color=settings.VISION_ENABLE_COLOR,
+                        enable_depth=True)
                     source.open()
                     self.depth_scale = source.depth_scale
                     self.intrinsics = source.intrinsics
@@ -584,9 +677,9 @@ class VisionPipeline:
                     self.depth_profile = source.depth_profile
                     self.first_frame_ms = source.first_frame_ms
                     self.camera_connected = True
-                    self.color_stream_active = True
-                    self.depth_stream_active = True
-                    self.tracker_active = True
+                    self.color_stream_active = bool(source.enable_color)
+                    self.depth_stream_active = bool(source.enable_depth)
+                    self.tracker_active = bool(source.enable_color)
                     self.state = RUNNING
                     self.last_error = None
                     self.missing_dependencies = []
@@ -659,6 +752,14 @@ class VisionPipeline:
         intr = self.intrinsics
         assert intr is not None
 
+        if colour is None:
+            # Depth-only smoke test: no colour frame means there is nothing
+            # for YOLO to look at. Count the frame and return. The detection,
+            # tracking and depth-measurement code below is untouched and runs
+            # unchanged the moment colour is enabled again.
+            self._count_frame(ts)
+            return
+
         detections = detector.track(colour)
 
         overlay_rows: list[tuple[dict[str, Any], Any]] = []
@@ -680,7 +781,12 @@ class VisionPipeline:
             overlay_rows.append((det, st))
 
         self.store.prune(ts)
+        self._count_frame(ts)
 
+        if settings.VISION_STREAM_ENABLED:
+            self._encode(colour, overlay_rows)
+
+    def _count_frame(self, ts) -> None:
         # fps: exponential average over frame intervals, so the number on the
         # status panel is the real throughput, not the camera's nominal rate.
         if self.latest_frame_timestamp is not None:
@@ -690,9 +796,6 @@ class VisionPipeline:
                 self.fps = round(inst if self.fps == 0 else 0.85 * self.fps + 0.15 * inst, 2)
         self.latest_frame_timestamp = ts
         self.frames_processed += 1
-
-        if settings.VISION_STREAM_ENABLED:
-            self._encode(colour, overlay_rows)
 
     # -- overlay + mjpeg ---------------------------------------------------
     def _encode(self, colour, rows) -> None:
@@ -744,10 +847,19 @@ class VisionPipeline:
                                [int(cv2.IMWRITE_JPEG_QUALITY), settings.VISION_JPEG_QUALITY])
         if not ok:
             return
+        payload = buf.tobytes()
         with self._jpeg_cv:
-            self._jpeg = buf.tobytes()
+            self._jpeg = payload
             self._jpeg_seq += 1
             self._jpeg_cv.notify_all()
+
+        # Rolling video evidence. Reuses the JPEG just encoded for the MJPEG
+        # stream, so buffering the last ~20 s costs no extra work in this
+        # loop. Deliberately outside `self._jpeg_cv`: the buffer has its own
+        # lock and must never be able to stall a stream reader.
+        if evidence_recorder is not None:
+            evidence_recorder.add_frame(jpeg=payload,
+                                        camera_id=EVIDENCE_CAMERA_ID)
 
     def latest_jpeg(self) -> tuple[bytes | None, int]:
         with self._jpeg_cv:

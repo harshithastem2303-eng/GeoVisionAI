@@ -12,6 +12,7 @@ from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from .config import settings
+from .tracing import sql_span
 
 _pool: ConnectionPool | None = None
 
@@ -44,24 +45,42 @@ def get_conn() -> Iterator[psycopg.Connection]:
         yield conn
 
 
+# Each of the three below opens a LangSmith child span when tracing is on, so
+# a traced request shows the exact PostGIS statements it ran and how many rows
+# each returned. `sql_span` is a no-op context manager when tracing is off, so
+# the untraced path is the same two lines it always was.
+#
+# Row COUNTS, never rows: /summary alone returns up to 100 joined event rows,
+# and shipping those to a third party on every dashboard poll is not what
+# anyone is asking for when they turn on tracing.
+
+
 def fetch_all(sql: str, params: tuple | dict | None = None) -> list[dict[str, Any]]:
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchall()
+    with sql_span("sql.fetch_all", sql, params) as span:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        span.end(outputs={"rows": len(rows)})
+        return rows
 
 
 def fetch_one(sql: str, params: tuple | dict | None = None) -> dict[str, Any] | None:
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchone()
+    with sql_span("sql.fetch_one", sql, params) as span:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        span.end(outputs={"rows": 0 if row is None else 1})
+        return row
 
 
 def execute(sql: str, params: tuple | dict | None = None) -> dict[str, Any] | None:
     """Execute a statement; returns the first row if the statement RETURNs."""
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute(sql, params)
-        row = cur.fetchone() if cur.description else None
-        conn.commit()
+    with sql_span("sql.execute", sql, params) as span:
+        with get_conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone() if cur.description else None
+            conn.commit()
+        span.end(outputs={"rows": 0 if row is None else 1, "returning": row is not None})
         return row
 
 

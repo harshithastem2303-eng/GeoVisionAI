@@ -111,6 +111,22 @@ class Settings:
     VISION_RECONNECT_S = _f("VISION_RECONNECT_S", 3.0)
     VISION_RECONNECT_MAX_S = _f("VISION_RECONNECT_MAX_S", 15.0)
 
+    # --- hardware-proven startup (Mac / D455) -----------------------------
+    # scripts/diag_realsense_startup.py established on real hardware that the
+    # only sequence that delivers frames here is:
+    #     enable_device(serial) + depth 640x480 Z16 @15 + pipeline.start(cfg)
+    # with no can_resolve() probe and no sensor/profile sweep before it.
+    #
+    # Bind the camera explicitly. Empty = discover, and refuse to guess when
+    # more than one RealSense is attached.
+    VISION_SERIAL = os.getenv("VISION_SERIAL", "").strip()
+    # Depth-only until the depth smoke test passes on the Mac. Colour is a
+    # second stream on the same USB link and a second thing that can fail; it
+    # is not part of this test.
+    VISION_ENABLE_COLOR = _b("VISION_ENABLE_COLOR", False)
+    # The rate the diagnostic actually started and streamed at.
+    VISION_DEPTH_FPS = _i("VISION_DEPTH_FPS", 15)
+
     # detector + tracker
     #
     # Weights live in <repo>/models so the installer can fetch them once, up
@@ -153,6 +169,31 @@ class Settings:
     # annotated MJPEG feed
     VISION_STREAM_ENABLED = _b("VISION_STREAM_ENABLED", True)
     VISION_JPEG_QUALITY = _i("VISION_JPEG_QUALITY", 70)
+
+    # --- LangSmith tracing (optional, OFF by default) ----------------------
+    # Records the association decision tree - request -> lookup -> the
+    # individual PostGIS queries - as one run per request. See
+    # backend/app/tracing.py and docs/TRACING.md.
+    #
+    # Off unless explicitly switched on. A checkout with no LangSmith account
+    # behaves exactly as it did before this existed.
+    LANGSMITH_TRACING = _b("LANGSMITH_TRACING", False)
+    LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "wastraq-demo")
+    # Blank means the SDK's default (https://api.smith.langchain.com). Set it
+    # for the EU region or a self-hosted instance.
+    LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT", "")
+    # One child span per database round trip. The statement and a row COUNT,
+    # never the rows themselves.
+    LANGSMITH_TRACE_SQL = _b("LANGSMITH_TRACE_SQL", True)
+    # Request paths that are never traced. These are polled by the dashboards
+    # or stream continuously; tracing them buries the collection events under
+    # identical polling spans.
+    LANGSMITH_TRACE_EXCLUDE = tuple(
+        s.strip() for s in os.getenv(
+            "LANGSMITH_TRACE_EXCLUDE",
+            "/assets,/vision/stream,/vision/tracks,/vision/status,/health,/favicon.ico",
+        ).split(",") if s.strip()
+    )
 
     API_HOST = os.getenv("API_HOST", "127.0.0.1")
     API_PORT = int(os.getenv("API_PORT", "8000"))
