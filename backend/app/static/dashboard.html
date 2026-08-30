@@ -12,6 +12,20 @@
   @media (max-width: 700px) { #opsmap { height: 320px; } }
   .feed-scroll { max-height: 460px; overflow-y: auto; }
   .an-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
+  /* The evidence count in the feed is a real <button> so it is reachable by
+     keyboard and announced as an action - it looks like the chips beside it
+     because it reports the same kind of fact. */
+  button.chip { border: 0; font: inherit; cursor: pointer; }
+  button.chip:hover { filter: brightness(1.08); }
+  button.chip:focus-visible { outline: 2px solid var(--accent, #4c8dff); outline-offset: 2px; }
+  .ev-stage { position: relative; max-width: 520px; }
+  .ev-stage .ev-load { padding: 10px 0 4px; }
+  .ev-stage .ev-fail { margin-top: 6px; }
+  /* The Live panel is the analytics grid at a tighter minimum: five
+     short columns that collapse to one on a phone. No new styling. */
+  .live-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 18px; }
+  .live-grid .kv { margin: 0; }
+  #liveCard.is-stale { opacity: .72; }
 </style>
 </head>
 <body>
@@ -72,6 +86,22 @@ main.innerHTML = `
   </div>
 
   <div class="kpis" id="kpis"></div>
+
+  <section class="card" id="liveCard">
+    <header>
+      <h2>Live collection state</h2>
+      <span class="small muted">GeoVision edge · WASTRAQ episode engine</span>
+      <div class="spacer" style="flex:1"></div>
+      <span class="status-pill" id="liveConn"><span>connecting…</span></span>
+    </header>
+    <div class="body live-grid" id="liveBody">
+      <div class="skel" style="height:96px"></div>
+      <div class="skel" style="height:96px"></div>
+      <div class="skel" style="height:96px"></div>
+      <div class="skel" style="height:96px"></div>
+      <div class="skel" style="height:96px"></div>
+    </div>
+  </section>
 
   <div class="ops-grid">
     <section class="card">
@@ -362,8 +392,7 @@ function renderFeed(rows) {
         WQ.chip(r.segregation_status) +
         (r.rfid_triggered ? '<span class="chip warn"><span class="dot"></span>RFID trigger</span>' : '') +
         (r.review_status === 'NEEDS_REVIEW' ? WQ.chip('NEEDS_REVIEW') : '') +
-        (Number(r.evidence_count) ? '<span class="chip accent"><span class="dot"></span>' +
-          r.evidence_count + ' evidence</span>' : '') +
+        evidenceAction(r) +
       '</div>' +
       '<div class="meta">' + WQ.esc(r.picker_name || r.picker_id || 'unassigned') +
         ' · confidence ' + (r.association_confidence ?? '—') +
@@ -371,6 +400,14 @@ function renderFeed(rows) {
   }).join('');
   WQ.$$('#feed .ev').forEach(el => el.addEventListener('click', () => {
     openProperty(el.getAttribute('data-prop'), el.getAttribute('data-ev'));
+  }));
+  // The evidence chip is an ACTION, not decoration: it opens the existing
+  // evidence modal for THAT event. stopPropagation because it sits inside
+  // the feed row, whose own click opens the property drawer - without it
+  // the operator would get both, and the drawer would cover the clip.
+  WQ.$$('#feed .ev-open').forEach(btn => btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openEvidence(btn.getAttribute('data-ev'));
   }));
 }
 
@@ -481,25 +518,257 @@ async function openProperty(pid, eventId) {
 
 WQ.$('#pd-ev').addEventListener('click', () => { if (drawerEvent) openEvidence(drawerEvent); });
 
+// --------------------------------------------------------- evidence media ---
+// One rule, and the UI is built around it: `media_url` is populated by the
+// backend ONLY when this Mac holds the bytes. The front end never decides
+// whether a string is playable.
+//
+// STEP 4C adds the second rule: nothing on this screen is a filesystem
+// path. The backend sends `source_label` - "GeoVision GEOVISION-D455-01 ·
+// CLIP-3f2a1b" - and that is the only provenance string rendered. The
+// Windows path is still in the payload as `source_ref` for the audit
+// trail, and there is deliberately no code path here that reads it.
+const MEDIA_NOTE = {
+  PENDING: 'Announced by GeoVision — the clip has not been copied to this Mac yet.',
+  UNAVAILABLE: 'GeoVision was asked for this clip and could not deliver it.',
+  NONE: 'No playable artefact on this record.'
+};
+
+// A player error the operator can act on, keyed off the browser's own
+// MediaError code. "It did not play" is not a useful thing to tell someone
+// standing in front of a councillor; "the file is here but this browser
+// cannot decode it" and "the connection dropped mid-clip" are.
+const MEDIA_ERR = {
+  1: 'Playback was aborted.',
+  2: 'The connection to this Mac dropped while the clip was loading.',
+  3: 'The clip is on this Mac but could not be decoded — the file may be truncated.',
+  4: 'This Mac could not serve the clip. It may have been removed from the evidence store.'
+};
+
+function mediaErrorText(code) {
+  return MEDIA_ERR[code] || 'The clip could not be played.';
+}
+
+// Provenance, never location. Falls back through identity only: if there
+// is no label and no clip id, the honest answer is that we do not know
+// which device recorded it - not the path it was recorded to.
+function sourceLabel(i) {
+  if (i.source_label) return i.source_label;
+  const parts = [i.clip_source_id, i.clip_id].filter(Boolean);
+  if (parts.length) return 'GeoVision ' + parts.join(' · ');
+  if (i.media_status && i.media_status !== 'NONE') return 'GeoVision edge';
+  return 'No source recorded';
+}
+
+function clipTiming(i) {
+  const bits = [];
+  if (i.clip_start) {
+    bits.push('clip ' + WQ.timeOf(i.clip_start) +
+      (i.clip_end ? ' → ' + WQ.timeOf(i.clip_end) : ''));
+  }
+  if (i.clip_seconds !== null && i.clip_seconds !== undefined) bits.push(i.clip_seconds + ' s');
+  if (i.frame_count) bits.push(WQ.num(i.frame_count) + ' frames');
+  if (i.clip_track_id !== null && i.clip_track_id !== undefined) bits.push('track ' + i.clip_track_id);
+  return bits.join(' · ');
+}
+
+// The player. Three states in one element, because they are three states
+// of the same thing and swapping between separate blocks is how a stale
+// spinner ends up sitting over a clip that is already playing:
+//
+//   .ev-load   until the browser reports it has frames
+//   <video>    HTML5, controls, Range-seekable (FileResponse does Range)
+//   .ev-fail   if the element raises `error`, with the reason and a retry
+//
+// preload="metadata" so opening an event with several clips does not pull
+// every clip's bytes at once; the operator clicks play on the one they
+// want.
+function evidencePlayer(i) {
+  if (i.media_status !== 'AVAILABLE' || !i.media_url) return '';
+  const id = WQ.esc(i.evidence_id);
+  if (i.media_kind === 'video') {
+    return '<div class="ev-stage" data-evid="' + id + '">' +
+      '<div class="ev-load small muted">Loading clip…</div>' +
+      '<video class="ev-media" controls preload="metadata" playsinline ' +
+        'style="width:100%;max-width:520px;border-radius:10px;background:#000" ' +
+        'src="' + WQ.esc(i.media_url) + '"' +
+        (i.media_content_type ? ' data-type="' + WQ.esc(i.media_content_type) + '"' : '') +
+        '></video>' +
+      '<div class="ev-fail err-box small" style="display:none"></div>' +
+    '</div>';
+  }
+  if (i.media_kind === 'image') {
+    return '<div class="photo-frame" style="max-width:420px">' +
+      '<img alt="Evidence" src="' + WQ.esc(i.media_url) + '"></div>';
+  }
+  return '<a class="mono small" href="' + WQ.esc(i.media_url) + '" download>Download artefact</a>';
+}
+
+function evidenceCard(i) {
+  const status = i.media_status || 'NONE';
+  const tone = status === 'AVAILABLE' ? 'good'
+    : (status === 'PENDING' ? 'warn' : (status === 'UNAVAILABLE' ? 'crit' : 'neutral'));
+  const held = status === 'AVAILABLE'
+    ? WQ.num(Math.round((i.media_bytes || 0) / 1024)) + ' KB held on this Mac'
+    : (MEDIA_NOTE[status] || status);
+  const timing = clipTiming(i);
+  return '<div class="note-box" style="margin-bottom:12px">' +
+    '<div class="row wrap" style="gap:8px;align-items:center;margin-bottom:8px">' +
+      '<span class="mono small">' + WQ.esc(i.evidence_id) + '</span>' +
+      '<span class="chip ' + tone + '"><span class="dot"></span>' +
+        WQ.esc(i.evidence_type.replace(/_/g, ' ').toLowerCase()) + '</span>' +
+      '<span class="chip ' + tone + '"><span class="dot"></span>' + WQ.esc(status) + '</span>' +
+      (i.verified ? WQ.chip('APPROVED', 'Verified')
+                  : '<span class="chip neutral"><span class="dot"></span>Unverified</span>') +
+      '<span class="small muted" style="margin-left:auto">' +
+        WQ.dateOf(i.captured_at) + ' ' + WQ.timeOf(i.captured_at) + '</span>' +
+    '</div>' +
+    evidencePlayer(i) +
+    '<div class="small muted" style="margin-top:6px">' + WQ.esc(held) + '</div>' +
+    (timing ? '<div class="small muted mono" style="margin-top:4px">' + WQ.esc(timing) + '</div>' : '') +
+    '<div class="small muted" style="margin-top:4px">origin: ' + WQ.esc(sourceLabel(i)) + '</div>' +
+    (i.fetch_error
+      ? '<div class="small" style="margin-top:4px;color:var(--crit)">' +
+        WQ.esc(i.fetch_error) + '</div>'
+      : '') +
+    (status === 'PENDING' || status === 'UNAVAILABLE'
+      ? '<button class="ev-fetch" data-evid="' + WQ.esc(i.evidence_id) +
+        '" style="margin-top:8px">Retrieve clip from GeoVision</button>'
+      : '') +
+  '</div>';
+}
+
+// Demo seed rows are separated out rather than listed as evidence. The
+// count beside an event is an offer to show footage; a row whose file was
+// never written cannot honour it, and padding the list with such rows is
+// how a demo ends up appearing to have evidence it does not have.
+function placeholderNote(items) {
+  const n = items.filter(i => i.is_placeholder).length;
+  if (!n) return '';
+  return '<div class="note-box small" style="margin-top:4px">' + n +
+    ' placeholder record' + (n === 1 ? '' : 's') + ' from the demo seed ' +
+    (n === 1 ? 'is' : 'are') + ' attached to this event and not shown — ' +
+    'nothing was ever recorded for ' + (n === 1 ? 'it' : 'them') + '.</div>';
+}
+
+function mediaFootnote(items) {
+  const held = items.filter(i => i.media_status === 'AVAILABLE').length;
+  const waiting = items.filter(i => i.media_status === 'PENDING' || i.media_status === 'UNAVAILABLE').length;
+  if (!waiting) return '';
+  return '<div class="note-box small" style="margin-top:4px">' + held + ' of ' +
+    items.length + ' artefacts are held on this Mac. ' + waiting +
+    ' were recorded by GeoVision and still need to be copied across — ' +
+    'the clip stays on the edge until then, and the record here is the pointer to it.</div>';
+}
+
+// The count/action shown on a feed event. Tone follows what clicking will
+// actually produce, so the chip is a promise the modal can keep.
+function evidenceAction(r) {
+  const playable = Number(r.playable_evidence_count || 0);
+  const clips = Number(r.clip_evidence_count || 0);
+  const all = Number(r.evidence_count || 0);
+  let cls, label;
+  if (playable) { cls = 'good'; label = '▶ ' + playable + (playable === 1 ? ' clip' : ' clips'); }
+  else if (clips) { cls = 'warn'; label = clips + (clips === 1 ? ' clip pending' : ' clips pending'); }
+  else if (all) { cls = 'accent'; label = all + ' evidence'; }
+  else return '';
+  return '<button type="button" class="chip ' + cls + ' ev-open" data-ev="' + WQ.esc(r.event_id) +
+    '" data-tip="Open the evidence for this event"><span class="dot"></span>' + label + '</button>';
+}
+
+function wireEvidenceFetch(eventId) {
+  document.querySelectorAll('#evm-body .ev-fetch').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      const id = btn.getAttribute('data-evid');
+      btn.disabled = true;
+      btn.textContent = 'Retrieving…';
+      try {
+        await WQ.api('/evidence/' + encodeURIComponent(id) + '/fetch', { method: 'POST' });
+      } catch (e) {
+        btn.textContent = 'Retrieve failed — retry';
+        btn.disabled = false;
+        return;
+      }
+      openEvidence(eventId);
+    });
+  });
+}
+
+// Loading and error states are attached, not inlined: an inline onerror on
+// a <video> whose src came from the API is one escaping mistake away from
+// being an injection point, and there is no reason to take that risk for a
+// spinner.
+function wireEvidenceMedia(eventId) {
+  document.querySelectorAll('#evm-body .ev-stage').forEach(stage => {
+    const v = stage.querySelector('video');
+    const load = stage.querySelector('.ev-load');
+    const fail = stage.querySelector('.ev-fail');
+    if (!v) return;
+    const done = () => { if (load) load.style.display = 'none'; };
+    // `loadeddata` is the honest signal - metadata alone means the browser
+    // has a duration, not a frame it can show.
+    v.addEventListener('loadeddata', done);
+    v.addEventListener('canplay', done);
+    v.addEventListener('playing', done);
+    v.addEventListener('error', () => {
+      done();
+      v.style.display = 'none';
+      if (!fail) return;
+      const code = (v.error && v.error.code) || 0;
+      fail.style.display = '';
+      fail.textContent = mediaErrorText(code) + ' ';
+      const again = document.createElement('button');
+      again.className = 'sm';
+      again.textContent = 'Re-fetch from GeoVision';
+      again.addEventListener('click', async () => {
+        again.disabled = true;
+        again.textContent = 'Re-fetching…';
+        const id = stage.getAttribute('data-evid');
+        try { await WQ.api('/evidence/' + encodeURIComponent(id) + '/fetch?force=true', { method: 'POST' }); }
+        catch (e) { WQ.toast('Re-fetch failed: ' + e.message, 'crit'); }
+        openEvidence(eventId);
+      });
+      fail.appendChild(again);
+    });
+    // If the element already failed before the listener was attached
+    // (a cached 409, a same-tick error), catch it rather than leaving the
+    // spinner up forever.
+    if (v.error) v.dispatchEvent(new Event('error'));
+    else if (v.readyState >= 2) done();
+  });
+}
+
+// Click-to-video. The whole of STEP 4C reduces to this function: an event
+// id in, the actual footage on screen. It is one request - the single-event
+// read already carries its evidence rows, each with the media state the
+// backend computed - plus the property, for the reference frontage photo.
 async function openEvidence(eventId) {
   EVM.open();
   WQ.$('#evm-title').textContent = 'Evidence — ' + eventId;
   WQ.$('#evm-body').innerHTML = '<div class="skel" style="height:120px"></div>';
   try {
-    const [ev, items] = await Promise.all([
-      WQ.api('/collection-events/' + encodeURIComponent(eventId)),
-      WQ.api('/collection-events/' + encodeURIComponent(eventId) + '/evidence')
-    ]);
-    const p = await WQ.api('/properties/' + encodeURIComponent(ev.property_id));
+    const ev = await WQ.api('/collection-events/' + encodeURIComponent(eventId));
+    const items = ev.evidence || [];
+    const real = items.filter(i => !i.is_placeholder);
+    let p = {};
+    try { p = await WQ.api('/properties/' + encodeURIComponent(ev.property_id)); }
+    catch (e) { p = {}; }   // the photo is context, not the evidence
+
+    WQ.$('#evm-title').textContent = 'Evidence — ' + ev.property_id + ' · ' + eventId;
     WQ.$('#evm-body').innerHTML =
       '<div class="row wrap" style="gap:6px;margin-bottom:14px">' +
         WQ.chip(ev.segregation_status) + WQ.chip(ev.review_status) +
         (ev.rfid_triggered ? '<span class="chip warn"><span class="dot"></span>RFID trigger</span>' : '') +
       '</div>' +
       '<dl class="kv" style="margin-bottom:16px">' +
-        '<dt>Property</dt><dd>' + WQ.esc(ev.property_id) + ' — ' + WQ.esc(p.owner_name || '') + '</dd>' +
-        '<dt>Picker</dt><dd>' + WQ.esc(ev.picker_id || '—') + '</dd>' +
-        '<dt>Collected</dt><dd>' + WQ.dateOf(ev.collection_time) + ' ' + WQ.timeOf(ev.collection_time) + '</dd>' +
+        '<dt>Property</dt><dd>' + WQ.esc(ev.property_id) +
+          (ev.house_number ? ' · ' + WQ.esc(ev.house_number) : '') +
+          (ev.owner_name || p.owner_name ? ' — ' + WQ.esc(ev.owner_name || p.owner_name) : '') + '</dd>' +
+        '<dt>Collector</dt><dd>' + WQ.esc(ev.picker_name || ev.picker_id || 'unassigned') +
+          (ev.picker_name && ev.picker_id
+            ? ' <span class="muted mono small">' + WQ.esc(ev.picker_id) + '</span>' : '') + '</dd>' +
+        '<dt>Event time</dt><dd>' + WQ.dateOf(ev.collection_time) + ' ' +
+          WQ.timeOf(ev.collection_time) + '</dd>' +
         '<dt>Track</dt><dd class="mono">' + WQ.esc(ev.track_id || '—') + '</dd>' +
         '<dt>Confidence</dt><dd class="mono">' + (ev.association_confidence ?? '—') + '</dd>' +
       '</dl>' +
@@ -509,20 +778,219 @@ async function openEvidence(eventId) {
           encodeURIComponent(ev.property_id) + '/photo" onerror="this.parentNode.innerHTML=' +
           '\'<div class=&quot;empty small&quot;>Photo file not on disk</div>\'"></div>'
         : '<div class="note-box small">No frontage reference photo.</div>') +
-      '<div class="section-title" style="margin:16px 0 8px">Evidence records (' + items.length + ')</div>' +
-      (items.length
-        ? '<table class="tbl"><thead><tr><th>ID</th><th>Type</th><th>Captured</th><th>Verified</th><th>File</th></tr></thead><tbody>' +
-          items.map(i => '<tr><td class="mono small">' + WQ.esc(i.evidence_id) + '</td>' +
-            '<td>' + WQ.esc(i.evidence_type.replace(/_/g, ' ').toLowerCase()) + '</td>' +
-            '<td class="small">' + WQ.dateOf(i.captured_at) + ' ' + WQ.timeOf(i.captured_at) + '</td>' +
-            '<td>' + (i.verified ? WQ.chip('APPROVED', 'Verified') : '<span class="chip neutral"><span class="dot"></span>Unverified</span>') + '</td>' +
-            '<td class="mono small muted">' + WQ.esc(i.file_path) + '</td></tr>').join('') +
-          '</tbody></table>' +
-          '<div class="note-box small" style="margin-top:12px">Evidence file paths are placeholders in the demo — ' +
-          'the camera/video capture that fills them is not wired up yet.</div>'
-        : WQ.emptyState('No evidence linked to this event'));
+      '<div class="section-title" style="margin:16px 0 8px">Evidence records (' + real.length + ')</div>' +
+      (real.length
+        ? real.map(evidenceCard).join('') + mediaFootnote(real)
+        : WQ.emptyState('No evidence linked to this event')) +
+      placeholderNote(items);
+    wireEvidenceFetch(eventId);
+    wireEvidenceMedia(eventId);
   } catch (e) {
     WQ.$('#evm-body').innerHTML = '<div class="err-box">' + WQ.esc(e.message) + '</div>';
+  }
+}
+
+// -------------------------------------------------- live collection state ---
+// One section, one endpoint, one job: show what is happening RIGHT NOW on
+// the lane - who the camera is tracking, whether that track is a bound
+// collector, what WASTRAQ has decided about it, and whether there is footage.
+//
+// Three rules it is built to keep:
+//
+//   1  It never blocks the dashboard. Its own poll, its own try/catch. An
+//      unreachable GeoVision laptop changes one pill on this card and
+//      nothing else on the page.
+//   2  It plays nothing itself. The ▶ action opens the EXISTING evidence
+//      modal via openEvidence(event_id), which owns the only <video> in
+//      this file and the only /evidence/{id}/media call.
+//   3  Nothing it renders is a filesystem path. The backend strips
+//      path-shaped material from the edge payload; this end renders only
+//      ids, counts and states.
+
+const LIVE_POLL_MS = 1500;
+
+function lchip(cls, label) {
+  return '<span class="chip ' + cls + '"><span class="dot"></span>' + WQ.esc(label) + '</span>';
+}
+function lval(v) {
+  return (v === null || v === undefined || v === '') ? '<span class="muted">—</span>' : WQ.esc(String(v));
+}
+function lmono(v) {
+  return (v === null || v === undefined || v === '') ? '<span class="muted">—</span>'
+    : '<span class="mono">' + WQ.esc(String(v)) + '</span>';
+}
+function lcol(title, inner) {
+  return '<div class="stack" style="gap:8px"><div class="section-title">' +
+    WQ.esc(title) + '</div>' + inner + '</div>';
+}
+function lempty(msg) { return '<div class="note-box small">' + WQ.esc(msg) + '</div>'; }
+
+const AUTH_CHIP = {
+  AUTHORIZED:   ['good', 'Authorized picker'],
+  UNAUTHORIZED: ['warn', 'Unauthorized track'],
+  NO_PICKER:    ['neutral', 'No picker']
+};
+const EP_CHIP = {
+  ACTIVE:  ['violet', 'Episode active'],
+  CLOSED:  ['good', 'Episode closed'],
+  ABORTED: ['warn', 'Episode aborted'],
+  NONE:    ['neutral', 'No episode']
+};
+const EVID_CHIP = {
+  AVAILABLE:   ['good', 'Clip available'],
+  PENDING:     ['warn', 'Clip pending'],
+  UNAVAILABLE: ['crit', 'Clip unavailable'],
+  NONE:        ['neutral', 'No clip']
+};
+
+function liveTracking(t) {
+  if (!t || !t.available) {
+    return lcol('Tracking', lempty('No active picker in frame.'));
+  }
+  const a = AUTH_CHIP[t.authorization_state] || AUTH_CHIP.NO_PICKER;
+  const depth = (t.depth_m === null || t.depth_m === undefined)
+    ? null : t.depth_m + ' m' + (t.depth_valid === false ? ' (unreliable)' : '');
+  return lcol('Tracking',
+    '<div class="row wrap" style="gap:6px">' + lchip(a[0], a[1]) +
+      (t.source === 'WASTRAQ_INGEST'
+        ? lchip('neutral', 'from WASTRAQ ingest') : '') + '</div>' +
+    '<dl class="kv">' +
+      '<dt>Track</dt><dd>' + lmono(t.track_id === null || t.track_id === undefined ? null : '#' + t.track_id) + '</dd>' +
+      '<dt>Collector</dt><dd>' + lval(t.collector_name || t.collector_id) +
+        (t.collector_name && t.collector_id
+          ? ' <span class="muted mono small">' + WQ.esc(t.collector_id) + '</span>' : '') + '</dd>' +
+      '<dt>RFID</dt><dd>' + lmono(t.rfid_uid) + '</dd>' +
+      '<dt>Depth</dt><dd>' + lmono(depth) + '</dd>' +
+      '<dt>Tracks in frame</dt><dd>' + lval(t.track_count) + '</dd>' +
+    '</dl>');
+}
+
+function liveBinding(b) {
+  if (!b || !b.bound) {
+    return lcol('Binding',
+      lchip('neutral', 'Not bound') +
+      lempty('No collector is bound to a track. Tap the RFID card to identify.'));
+  }
+  const arrow = (b.collector_id || '—') + ' → ' +
+    (b.track_id === null || b.track_id === undefined ? '—' : '#' + b.track_id);
+  return lcol('Binding',
+    '<div class="row wrap" style="gap:6px">' + lchip('good', 'Bound') +
+      (b.locked === true ? lchip('accent', 'Locked') : '') +
+      (b.known_to_geovision === false ? lchip('warn', 'Not yet on the edge') : '') + '</div>' +
+    '<dl class="kv">' +
+      '<dt>Collector → track</dt><dd>' + lmono(arrow) + '</dd>' +
+      '<dt>Collector</dt><dd>' + lval(b.collector_name || b.collector_id) + '</dd>' +
+      '<dt>RFID</dt><dd>' + lmono(b.rfid_uid) + '</dd>' +
+      '<dt>Identity conf.</dt><dd>' + lmono(b.identity_confidence) + '</dd>' +
+      '<dt>Rule</dt><dd>' + lval(b.selection_rule) + '</dd>' +
+    '</dl>');
+}
+
+function liveEpisode(e) {
+  if (!e || e.state === 'NONE') {
+    const c = e && e.candidate;
+    return lcol('WASTRAQ episode',
+      lchip('neutral', 'No active episode') +
+      (c && c.property_id
+        ? '<dl class="kv"><dt>Dwelling at</dt><dd>' + lmono(c.property_id) + '</dd>' +
+          '<dt>Dwell</dt><dd>' + lmono((c.dwell_s === null ? '—' : c.dwell_s + ' s') +
+            (c.dwell_required_s ? ' of ' + c.dwell_required_s + ' s' : '')) + '</dd></dl>'
+        : lempty('No collection episode is open.')));
+  }
+  const chip = EP_CHIP[e.state] || EP_CHIP.NONE;
+  return lcol('WASTRAQ episode',
+    '<div class="row wrap" style="gap:6px">' + lchip(chip[0], chip[1]) +
+      (e.segregation_status ? WQ.chip(e.segregation_status) : '') + '</div>' +
+    '<dl class="kv">' +
+      '<dt>Episode</dt><dd>' + lmono(e.episode_id) + '</dd>' +
+      '<dt>Property</dt><dd>' + lmono(e.property_id) +
+        (e.house_number ? ' <span class="muted small">' + WQ.esc(e.house_number) + '</span>' : '') + '</dd>' +
+      '<dt>Association</dt><dd>' + lval(e.association_status) +
+        (e.association_confidence !== null && e.association_confidence !== undefined
+          ? ' <span class="mono small">' + WQ.esc(e.association_confidence) + '</span>' : '') + '</dd>' +
+      '<dt>Observations</dt><dd>' + lval(e.observations) + '</dd>' +
+      '<dt>Track</dt><dd>' + lmono(e.track_id === null || e.track_id === undefined ? null : '#' + e.track_id) + '</dd>' +
+    '</dl>');
+}
+
+// The ▶ action carries the EVENT id and nothing else. Clicking it calls the
+// same openEvidence() the feed's evidence chip calls, so there is one modal,
+// one player and one media path in this dashboard.
+function liveEvidence(ev) {
+  if (!ev || !ev.event_id) {
+    return lcol('Evidence', lchip('neutral', 'No evidence yet') +
+      lempty('No collection event on this lane yet.'));
+  }
+  const chip = EVID_CHIP[ev.media_status] || EVID_CHIP.NONE;
+  let action = '';
+  if (ev.media_status === 'AVAILABLE') {
+    action = '<button type="button" class="primary sm" id="livePlay" data-ev="' +
+      WQ.esc(ev.event_id) + '" data-tip="Open the evidence for this event">▶ Play clip</button>';
+  } else if (ev.media_status === 'PENDING') {
+    action = lempty('Clip pending — GeoVision has announced it and the bytes ' +
+      'have not been copied to this Mac yet.');
+  } else if (ev.media_status === 'UNAVAILABLE') {
+    action = '<div class="err-box small">GeoVision was asked for this clip and ' +
+      'could not deliver it. Open the event to retry the retrieval.</div>' +
+      '<button type="button" class="sm" id="livePlay" data-ev="' + WQ.esc(ev.event_id) +
+      '">Open evidence</button>';
+  }
+  return lcol('Evidence',
+    '<div class="row wrap" style="gap:6px">' + lchip(chip[0], chip[1]) +
+      (ev.from_episode ? '' : lchip('neutral', 'latest event')) + '</div>' +
+    '<dl class="kv">' +
+      '<dt>Event</dt><dd>' + lmono(ev.event_id) + '</dd>' +
+      '<dt>Evidence</dt><dd>' + lval(ev.evidence_count) + '</dd>' +
+      '<dt>Playable clips</dt><dd>' + lval(ev.playable_count) + '</dd>' +
+    '</dl>' + action);
+}
+
+function liveHealth(h) {
+  const gv = h.geovision_connected;
+  return lcol('Health',
+    '<div class="row wrap" style="gap:6px">' +
+      lchip(gv ? 'good' : 'crit', gv ? 'GeoVision connected' : 'GeoVision disconnected') +
+      lchip(h.episode_engine_enabled ? 'good' : 'warn',
+            h.episode_engine_enabled ? 'Episode engine on' : 'Episode engine off') +
+      lchip(h.camera_configured ? 'good' : 'warn',
+            h.camera_configured ? 'Camera configured' : 'Camera pose unset') +
+    '</div>' +
+    (!gv && h.geovision_error
+      ? '<div class="note-box small">GeoVision edge unreachable: ' +
+        WQ.esc(h.geovision_error) + '</div>' : '') +
+    '<dl class="kv">' +
+      '<dt>Edge observations</dt><dd>' + lval(h.ingest_track_count) + '</dd>' +
+      '<dt>Active episodes</dt><dd>' + lval(h.db_active_episodes) + '</dd>' +
+      '<dt>Episode mirror</dt><dd>' + (h.mirror_enabled ? 'on' : '<span class="muted">off</span>') + '</dd>' +
+    '</dl>');
+}
+
+function renderLive(s) {
+  WQ.$('#liveBody').innerHTML =
+    liveTracking(s.tracking) + liveBinding(s.binding) + liveEpisode(s.episode) +
+    liveEvidence(s.evidence) + liveHealth(s.health);
+  const gv = s.health && s.health.geovision_connected;
+  WQ.$('#liveConn').innerHTML = '<span>' +
+    (gv ? 'GeoVision live' : 'GeoVision offline') + ' · ' +
+    new Date().toLocaleTimeString() + '</span>';
+  WQ.$('#liveCard').classList.remove('is-stale');
+  const play = WQ.$('#livePlay');
+  if (play) play.addEventListener('click', () => openEvidence(play.getAttribute('data-ev')));
+}
+
+let liveBusy = false;
+async function refreshLive() {
+  if (liveBusy || document.hidden) return;
+  liveBusy = true;
+  try {
+    renderLive(await WQ.api('/live/state'));
+  } catch (e) {
+    // The panel dims and says so. It never throws into the page: the map,
+    // the feed, the KPIs and the modals are not downstream of this card.
+    WQ.$('#liveCard').classList.add('is-stale');
+    WQ.$('#liveConn').innerHTML = '<span>live state unavailable</span>';
+  } finally {
+    liveBusy = false;
   }
 }
 
@@ -563,6 +1031,10 @@ WQ.$$('#rateSeg button').forEach(b => b.addEventListener('click', () => {
     await loadPickers();
   } catch (e) { WQ.toast('Startup: ' + e.message, 'crit'); }
   auto.start();
+  // Its own cadence - 1.5 s, for demo responsiveness - deliberately separate
+  // from the 10 s operations refresh above, which stays exactly as it was.
+  refreshLive();
+  setInterval(refreshLive, LIVE_POLL_MS);
 })();
 document.addEventListener('wq:theme', () => paintMap());
 </script>

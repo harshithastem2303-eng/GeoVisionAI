@@ -16,9 +16,10 @@ from fastapi.staticfiles import StaticFiles
 from . import __version__
 from .config import settings
 from .database import close_pool, fetch_all, fetch_one, init_pool
+from .episodes import router as episodes_router
 from .integrations import router as geovision_router
-from .routes import (collection_events, evidence, evidence_clips, gis_routes, properties,
-                     property_registry)
+from .routes import (collection_events, evidence, evidence_clips, gis_routes,
+                     live_state, properties, property_registry)
 from .survey import router as survey_router
 from .tracing import LangSmithTraceMiddleware, tracing_enabled, tracing_status
 
@@ -57,7 +58,30 @@ async def lifespan(app: FastAPI):
         # started by the picker-tracking page, not by running the backend.
         from .vision.pipeline import maybe_autostart
         maybe_autostart()
+
+    # The episode sweeper closes an episode whose track simply stopped
+    # reporting - the collector walked out of frame and the edge went quiet.
+    # Without it, "leave" would depend on receiving an event that says the
+    # collector left, and no such event exists.
+    try:
+        from .episodes.engine import get_engine
+        _engine = get_engine()
+        _engine.start_sweeper()
+        if _engine.config.enabled and not _engine.config.camera_configured:
+            print("[episodes] engine ON but CAMERA_ORIGIN_LAT/LON are unset - "
+                  "no episodes will be created. Set them in backend/.env.")
+    except Exception as _episode_error:  # noqa: BLE001
+        print("!! Episode engine not started:", repr(_episode_error))
+
     yield
+
+    try:
+        from .episodes.engine import get_engine as _ge
+        _ge().stop_sweeper()
+        from .episodes.mirror import get_mirror as _gm
+        _gm().stop()
+    except Exception:  # noqa: BLE001
+        pass
     if vision_router is not None:
         # Release the camera before the process goes away, so the next run
         # does not find the device busy.
@@ -104,6 +128,14 @@ app.include_router(survey_router)
 # Inbound edge observations. Registered after the property/GIS routers on
 # purpose: it owns its own /integrations prefix and must never shadow them.
 app.include_router(geovision_router)
+# WASTRAQ's own episode engine: bound track + service zone + dwell ->
+# collection event. Registered after the GeoVision receiver, which feeds it.
+app.include_router(episodes_router)
+# Read-only live state for the dashboard's Live panel: the episode engine's
+# own snapshot plus a proxied read of the GeoVision edge. Registered last of
+# the API routers because it owns a fresh /live prefix and reads only what
+# the routers above already expose.
+app.include_router(live_state.router)
 if vision_router is not None:
     app.include_router(vision_router)
 
@@ -142,6 +174,32 @@ def health_vision():
         return {"status": "unavailable", "import_error": VISION_IMPORT_ERROR}
     from .vision.pipeline import pipeline as _p
     return {"status": "ok", **_p.status()}
+
+
+@app.get("/health/episodes", tags=["health"])
+def health_episodes():
+    """Is the episode engine armed, and does it know where the camera is.
+
+    Its own health route for the same reason as /health/vision: an engine
+    that is switched on but has no camera pose is not "working", it is
+    silently producing nothing, and that must be visible without reading
+    logs.
+    """
+    try:
+        from .episodes.engine import get_engine
+        from .episodes.mirror import get_mirror
+        engine = get_engine()
+        return {
+            "status": "ok" if (engine.config.enabled
+                               and engine.config.camera_configured) else "idle",
+            "enabled": engine.config.enabled,
+            "camera_configured": engine.config.camera_configured,
+            "active_episodes": len(engine.snapshot()["active_episodes"]),
+            "bindings": len(engine.snapshot()["bindings"]),
+            "mirror": get_mirror().status(),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "unavailable", "error": repr(exc)}
 
 
 @app.get("/health/tracing", tags=["health"])

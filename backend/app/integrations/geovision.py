@@ -1,6 +1,6 @@
 """The GeoVision edge receiver.
 
-    POST /integrations/geovision/events   ingest one edge event
+    POST /integrations/geovision/events   ingest one edge event (6 types)
     GET  /integrations/geovision/status   what has arrived, and from whom
     GET  /integrations/geovision/events   recent raw envelopes (inspection)
 
@@ -121,7 +121,9 @@ def integration_status(
         "property_association": {
             "performed_here": False,
             "authority": "WASTRAQ PostGIS service-zone association (POST /gis/lookup)",
-            "note": "GeoVision events carry no property. RFID identifies who and when, not where.",
+            "note": ("GeoVision events carry no property. RFID identifies who and "
+                     "when, not where; a NON_SEGREGATION_TRIGGER identifies which "
+                     "WASTRAQ episode, not which house."),
         },
 
         "totals": service.totals(),
@@ -141,6 +143,10 @@ def integration_status(
         "recent_rfid_taps": service.recent_rfid_taps(),
         "recent_worker_bindings": service.recent_bindings(),
         "recent_evidence_clips": service.recent_clips(),
+        # The sixth event, and WASTRAQ's verdict on each. A trigger that
+        # could not be landed shows up here with needs_review = true rather
+        # than disappearing.
+        "recent_non_segregation_triggers": service.recent_triggers(),
     }
 
 

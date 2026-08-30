@@ -2,7 +2,7 @@
 
 The authority for these shapes is the sender:
 ``geovision-darshan/docs/WASTRAQ_INTEGRATION.md`` and the builders in
-``geovision-darshan/backend/integration/events.py``. Five event types, one
+``geovision-darshan/backend/integration/events.py``. Six event types, one
 envelope.
 
 Two validation policies, on purpose
@@ -35,6 +35,10 @@ EVENT_TYPES = (
     "WORKER_TRACK_BOUND",
     "EVIDENCE_READY",
     "HEARTBEAT",
+    # Sixth event: a bound collector tapped again. A SIGNAL, not a verdict -
+    # see NonSegregationTriggerEvent below for why that distinction is
+    # enforced structurally rather than by convention.
+    "NON_SEGREGATION_TRIGGER",
 )
 
 BINDING_STATUSES = (
@@ -253,17 +257,63 @@ class WorkerTrackBoundEvent(GeoVisionEnvelope):
 
 # --- EVIDENCE_READY ----------------------------------------------------------
 class EvidenceReadyEvent(GeoVisionEnvelope):
-    """A clip exists on the GeoVision machine. A reference, never the bytes."""
+    """A clip exists on the GeoVision machine. A reference, never the bytes.
+
+    ``file_path`` is where the clip sits on WINDOWS. It is provenance and
+    nothing else: WASTRAQ stores it in ``geovision_evidence_clips``, shows
+    it as the origin of a record, and never hands it to a browser. A Mac
+    cannot open a Windows path, and a UI that renders one as "the evidence"
+    is claiming something the system cannot deliver.
+
+    ``file_url`` is the field that makes the clip retrievable: an HTTP URL
+    the edge serves the bytes from. Optional, because a GeoVision build
+    that predates it must keep working - when it is absent WASTRAQ derives
+    the URL from ``GEOVISION_EDGE_BASE_URL`` and
+    ``GEOVISION_CLIP_URL_TEMPLATE``. What WASTRAQ will not do is invent a
+    URL out of the Windows path; there is no transformation between them
+    that is right rather than lucky.
+    """
 
     event_type: Literal["EVIDENCE_READY"]
 
     clip_id: str = Field(..., min_length=1, max_length=128)
     file_path: str = Field(..., min_length=1, max_length=1024)
+    #: Absolute http(s) URL on the edge returning the clip bytes, or a path
+    #: relative to GEOVISION_EDGE_BASE_URL. Anything else is refused rather
+    #: than stored: a file:// or UNC "URL" is a Windows path wearing a hat,
+    #: and the whole point of this field is to not be that.
+    file_url: str | None = Field(None, max_length=2048)
+    content_type: str | None = Field(None, max_length=128)
+    size_bytes: int | None = Field(None, ge=0)
+    #: Hex sha256 of the clip as written on the edge. When present, WASTRAQ
+    #: refuses to mark a fetched copy STORED unless it matches.
+    sha256: str | None = Field(None, min_length=64, max_length=64,
+                               pattern=r"^[0-9a-fA-F]{64}$")
     start_time: datetime | None = None
     end_time: datetime | None = None
     frame_count: int | None = Field(None, ge=0)
     track_id: int | None = None
     rfid_event_id: str | None = Field(None, max_length=128)
+
+    @field_validator("file_url")
+    @classmethod
+    def _http_only(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = value.strip()
+        if not text:
+            return None
+        lowered = text.lower()
+        if lowered.startswith(("http://", "https://")):
+            return text
+        if text.startswith("/"):
+            # Relative to the configured edge base. Useful, and unambiguous.
+            return text
+        raise ValueError(
+            "file_url must be an http(s) URL or a path beginning with '/'; "
+            f"refusing {value!r} - a file:// or UNC location is not something "
+            "WASTRAQ can retrieve or a browser can play"
+        )
 
     @field_validator("start_time", "end_time")
     @classmethod
@@ -290,6 +340,69 @@ class HeartbeatEvent(GeoVisionEnvelope):
     status: dict[str, Any] = Field(default_factory=dict)
 
 
+# --- NON_SEGREGATION_TRIGGER -------------------------------------------------
+class NonSegregationTriggerEvent(GeoVisionEnvelope):
+    """A bound collector tapped their card a second time.
+
+    On the edge this means "the waste at the property I am servicing is not
+    segregated". Read that sentence again: *the property I am servicing*.
+    GeoVision does not know which property that is, and this event does not
+    say. It carries an ``episode_id`` - an identifier WASTRAQ itself minted
+    and pushed to the edge's mirror - and WASTRAQ resolves that back to the
+    property IT associated, by service zone, at the time.
+
+    Which is why there is no ``property_id`` and no ``segregation_status``
+    field here, and why there cannot be one: both are in
+    ``FORBIDDEN_PROPERTY_FIELDS``, so the envelope validator refuses the
+    whole event if either appears. The sixth event is structurally unable to
+    assert a verdict, exactly like the first five.
+
+    ``trigger_id`` is the edge's identifier for the DECISION, distinct from
+    the envelope's ``event_id`` which identifies the DELIVERY. WASTRAQ
+    deduplicates on both: ``event_id`` stops a retried packet, ``trigger_id``
+    stops a re-announced decision from flagging a second house.
+    """
+
+    event_type: Literal["NON_SEGREGATION_TRIGGER"]
+
+    trigger_id: str = Field(..., min_length=1, max_length=128)
+    #: The WASTRAQ episode the edge believes is live. Null when the edge had
+    #: nothing to point at - which is a real, publishable outcome, not an
+    #: error, and must not be turned into a guess on arrival.
+    episode_id: str | None = Field(None, max_length=128)
+    collector_id: str | None = Field(None, max_length=64)
+    rfid_uid: str | None = Field(None, max_length=64)
+    track_id: int | None = None
+    #: RESOLVED / NO_ACTIVE_EPISODE / EPISODE_NOT_ACTIONABLE /
+    #: DUPLICATE_TRIGGER / ... Deliberately a free string rather than a
+    #: Literal: the edge owns this vocabulary and will extend it, and an
+    #: unheard-of status must degrade to "not actionable, kept for review"
+    #: rather than 422 the delivery. The receiver treats an unknown status as
+    #: non-authoritative either way - only WASTRAQ's own episode can cause an
+    #: application.
+    trigger_status: str | None = Field(None, max_length=64)
+    #: The edge's own idempotency verdict. Advisory; WASTRAQ keeps its own.
+    duplicate: bool = False
+    rfid_event_id: str | None = Field(None, max_length=128)
+
+    @model_validator(mode="after")
+    def _episode_required_when_resolved(self) -> "NonSegregationTriggerEvent":
+        """A trigger claiming to be resolved must name what it resolved to.
+
+        Same shape of rule as RFID_TAP's "only BOUND may name a track": a
+        status that asserts success while withholding the identifier has
+        already lost the information that makes it checkable.
+        """
+        status = (self.trigger_status or "").upper()
+        if status in {"RESOLVED", "TRIGGERED", "APPLIED"} and not self.episode_id:
+            raise ValueError(
+                f"trigger_status {status!r} requires an episode_id; a resolved "
+                "trigger that names no episode cannot be verified against "
+                "WASTRAQ's own episode and must not be guessed at"
+            )
+        return self
+
+
 GeoVisionEvent = Annotated[
     Union[
         TrackUpdateEvent,
@@ -297,21 +410,31 @@ GeoVisionEvent = Annotated[
         WorkerTrackBoundEvent,
         EvidenceReadyEvent,
         HeartbeatEvent,
+        NonSegregationTriggerEvent,
     ],
     Field(discriminator="event_type"),
 ]
 
-#: Validate an arbitrary dict into exactly one of the five events.
+#: Validate an arbitrary dict into exactly one of the six events.
 EVENT_ADAPTER: TypeAdapter[GeoVisionEvent] = TypeAdapter(GeoVisionEvent)
 
 
 # --- responses ---------------------------------------------------------------
 class IngestAck(BaseModel):
     """Deliberately tiny. The sender's timeout is 2 s and it only reads the
-    HTTP status; anything larger is bytes across site wifi for nothing."""
+    HTTP status; anything larger is bytes across site wifi for nothing.
+
+    ``derived`` is the one exception, and it is omitted for TRACK_UPDATE -
+    the 5 Hz stream - so the hot path stays as small as it was. For the four
+    events a human actually sends by hand (a bind, a trigger, a clip), it is
+    what turns "did that work?" from a log-tailing exercise into the response
+    body. It never contains a decision the caller made; it reports what
+    WASTRAQ decided.
+    """
 
     status: Literal["ACCEPTED", "DUPLICATE"]
     event_id: str
     event_type: str
     duplicate: bool
     received_at: datetime
+    derived: dict[str, Any] | None = None

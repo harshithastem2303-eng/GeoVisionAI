@@ -184,6 +184,96 @@ class Settings:
     # busy device may only be heard from via TRACK_UPDATE.
     GEOVISION_DEVICE_STALE_S = _f("GEOVISION_DEVICE_STALE_S", 60.0)
 
+    # --- Windows episode mirror (outbound to GeoVision) -------------------
+    # WASTRAQ pushes the id of the episode it has decided is live so a second
+    # RFID tap on the edge has something to point at. Advisory: the edge
+    # cannot name a property and this mirror carries none.
+    #
+    # No default host on purpose. A hard-coded laptop IP in source is how a
+    # demo ends up posting to someone else's DHCP lease; blank simply means
+    # mirroring is off, which is the correct behaviour with no edge attached.
+    GEOVISION_EDGE_BASE_URL = os.getenv("GEOVISION_EDGE_BASE_URL", "").strip()
+    GEOVISION_EDGE_MIRROR_ENABLED = _b("GEOVISION_EDGE_MIRROR_ENABLED", True)
+    # The edge's own inbound timeout is 2 s; there is no reason to wait longer
+    # than it will.
+    GEOVISION_EDGE_TIMEOUT_S = _f("GEOVISION_EDGE_TIMEOUT_S", 2.0)
+    GEOVISION_EDGE_RETRIES = _i("GEOVISION_EDGE_RETRIES", 1)
+
+    # --- evidence media (STEP 4A: playing the edge's clip on the Mac) -----
+    # Where fetched evidence bytes live. Defaults to the same <repo>/evidence
+    # directory the local rolling recorder already writes to, so there is one
+    # evidence root on this machine rather than two.
+    EVIDENCE_MEDIA_ROOT = os.getenv(
+        "EVIDENCE_MEDIA_ROOT",
+        os.getenv("EVIDENCE_DIR",
+                  os.path.join(os.path.dirname(os.path.dirname(
+                      os.path.dirname(os.path.abspath(__file__)))), "evidence")),
+    )
+    # How to ask the edge for a clip's bytes when EVIDENCE_READY did not
+    # carry an explicit file_url. Joined onto GEOVISION_EDGE_BASE_URL.
+    # Placeholders: {clip_id}, {source_id}, {event_id}.
+    GEOVISION_CLIP_URL_TEMPLATE = os.getenv(
+        "GEOVISION_CLIP_URL_TEMPLATE", "/evidence/clips/{clip_id}/file")
+    # Master switch for pulling bytes across at all. Off = clips stay
+    # announced-but-not-held, and the dashboard says exactly that.
+    GEOVISION_CLIP_FETCH_ENABLED = _b("GEOVISION_CLIP_FETCH_ENABLED", True)
+    # Pull as soon as EVIDENCE_READY lands, on a background thread. The ack
+    # is never waiting on it.
+    GEOVISION_CLIP_FETCH_ON_INGEST = _b("GEOVISION_CLIP_FETCH_ON_INGEST", True)
+    # Generous compared with the 2 s mirror timeout: this is a multi-megabyte
+    # file over site wifi, not a control message.
+    GEOVISION_CLIP_FETCH_TIMEOUT_S = _f("GEOVISION_CLIP_FETCH_TIMEOUT_S", 20.0)
+    # Hard ceiling on what a single announced clip may write to this disk.
+    # A 15 s 640x480 clip is single-digit megabytes; 200 MB is a backstop
+    # against a misconfigured edge, not a working limit.
+    GEOVISION_CLIP_MAX_BYTES = _i("GEOVISION_CLIP_MAX_BYTES", 200_000_000)
+
+    # --- collection episode engine ----------------------------------------
+    # Turns a BOUND camera track dwelling in one mapped service zone into an
+    # episode, and an episode into a collection event.
+    EPISODE_ENGINE_ENABLED = _b("EPISODE_ENGINE_ENABLED", True)
+    # How long the collector must stay in one service zone before it counts.
+    # Walking past a gate is not a collection.
+    EPISODE_DWELL_S = _f("EPISODE_DWELL_S", 3.0)
+    # How long they must be out of it before the episode closes. Covers the
+    # collector stepping aside, and a depth dropout of a second or two.
+    EPISODE_LEAVE_GRACE_S = _f("EPISODE_LEAVE_GRACE_S", 4.0)
+    # Minimum gap between PostGIS association queries for one track. The edge
+    # publishes at ~5 Hz; nobody crosses a service zone in 400 ms.
+    EPISODE_MIN_ASSOC_INTERVAL_S = _f("EPISODE_MIN_ASSOC_INTERVAL_S", 0.4)
+    # A backstop, not a business rule: an episode this long means the track
+    # got stuck, not that one bin took three minutes.
+    EPISODE_MAX_DURATION_S = _f("EPISODE_MAX_DURATION_S", 180.0)
+    # Below this association confidence the episode is created but flagged
+    # REVIEW, and its collection event lands as NEEDS_REVIEW.
+    EPISODE_REVIEW_CONFIDENCE = _f("EPISODE_REVIEW_CONFIDENCE", 0.85)
+    # A binding older than this is not trusted to still describe reality.
+    EPISODE_BINDING_TTL_S = _f("EPISODE_BINDING_TTL_S", 900.0)
+    # A trigger can lose a race with the collector walking away. Inside this
+    # window it still belongs to the episode that just closed.
+    EPISODE_TRIGGER_LATE_GRACE_S = _f("EPISODE_TRIGGER_LATE_GRACE_S", 30.0)
+    # How far from an episode a clip may sit and still be attributed to it.
+    EPISODE_EVIDENCE_LINK_WINDOW_S = _f("EPISODE_EVIDENCE_LINK_WINDOW_S", 120.0)
+    # Only use observations the edge itself vouches for. Turning this off
+    # lets un-validated depth decide which house was served - do not.
+    EPISODE_REQUIRE_DEPTH_VALID = _b("EPISODE_REQUIRE_DEPTH_VALID", True)
+
+    # --- fixed camera pose -------------------------------------------------
+    # Where the GeoVision camera stands and which way it looks. Without these
+    # the engine has no way to turn camera metres into a map position, so it
+    # makes no association at all rather than a wrong one: unset = episodes
+    # are never created, and /episodes/status says camera_configured false.
+    #
+    # CAMERA_HEADING_DEG is the compass bearing of the camera's FORWARD axis,
+    # degrees clockwise from true north (0 = north, 90 = east).
+    CAMERA_ORIGIN_LAT = _f("CAMERA_ORIGIN_LAT", 0.0)
+    CAMERA_ORIGIN_LON = _f("CAMERA_ORIGIN_LON", 0.0)
+    CAMERA_HEADING_DEG = _f("CAMERA_HEADING_DEG", 0.0)
+    # Lever arm from the surveyed mark to the optical centre, in the camera's
+    # own frame (right, forward). Usually zero.
+    CAMERA_OFFSET_RIGHT_M = _f("CAMERA_OFFSET_RIGHT_M", 0.0)
+    CAMERA_OFFSET_FORWARD_M = _f("CAMERA_OFFSET_FORWARD_M", 0.0)
+
     # --- LangSmith tracing (optional, OFF by default) ----------------------
     # Records the association decision tree - request -> lookup -> the
     # individual PostGIS queries - as one run per request. See

@@ -2,17 +2,18 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 
+from .. import evidence_media
 from ..config import settings
 from ..database import execute, fetch_all, fetch_one
 from ..gis import lookup_property
 from ..models import fake_evidence_path, next_event_id, next_evidence_id
-from ..tracing import annotate_run
 from ..schemas import (
     CollectionEventCreate,
     CollectionEventOut,
     CollectionEventWithEvidence,
     NonSegregationRequest,
 )
+from ..tracing import annotate_run
 
 # Rolling video evidence. Optional -- a failure here must not stop the
 # status write, which is the operation the demo depends on.
@@ -75,10 +76,41 @@ def event_feed(
                ce.rfid_triggered, ce.review_status,
                p.house_number, p.owner_name, p.formatted_address, p.route_id,
                pk.picker_name,
-               (SELECT count(*) FROM evidence e WHERE e.event_id = ce.event_id) AS evidence_count
+               ev.evidence_count, ev.clip_evidence_count,
+               ev.playable_evidence_count, ev.local_evidence_count
         FROM collection_events ce
         JOIN properties p ON p.property_id = ce.property_id
         LEFT JOIN pickers pk ON pk.picker_id = ce.picker_id
+        -- STEP 4C. The feed offers an evidence ACTION, so the number beside
+        -- it has to mean something an operator can click through to.
+        --
+        --   evidence_count           every row, unchanged for callers
+        --   clip_evidence_count      rows that came from a GeoVision clip
+        --   playable_evidence_count  clips whose bytes are on this Mac
+        --   local_evidence_count     everything else: a local capture, or a
+        --                            demo seed row that was never a file
+        --
+        -- Whether a local row is a real capture or a placeholder depends on
+        -- a file existing, which SQL cannot see. That distinction is made
+        -- once, in `evidence_media.describe`, and the feed does not guess at
+        -- it: it only promises playback for the count it can stand behind.
+        --
+        -- Counted in one LATERAL rather than four scalar sub-selects: the
+        -- feed is polled every few seconds, and this way the evidence rows
+        -- for an event are visited once.
+        --
+        -- `playable` here means the database believes the file is held.
+        -- The modal re-checks on disk before it renders a player, so a
+        -- deleted file downgrades there rather than being promised twice.
+        LEFT JOIN LATERAL (
+            SELECT count(*)                                          AS evidence_count,
+                   count(*) FILTER (WHERE v.clip_event_id IS NOT NULL)
+                                                                     AS clip_evidence_count,
+                   count(*) FILTER (WHERE v.media_state = 'STORED')  AS playable_evidence_count,
+                   count(*) FILTER (WHERE v.clip_event_id IS NULL)   AS local_evidence_count
+              FROM v_evidence_media v
+             WHERE v.event_id = ce.event_id
+        ) ev ON TRUE
         WHERE (%(route_id)s::text IS NULL OR p.route_id = %(route_id)s)
           AND (%(seg)s::text    IS NULL OR ce.segregation_status = %(seg)s)
           AND (%(rev)s::text    IS NULL OR ce.review_status = %(rev)s)
@@ -179,12 +211,27 @@ def create_event(req: CollectionEventCreate):
 
 @router.get("/{event_id}", response_model=CollectionEventWithEvidence)
 def get_event(event_id: str):
-    row = fetch_one("SELECT * FROM collection_events WHERE event_id = %s", (event_id,))
+    # STEP 4C: the evidence modal names the collector, not just their id.
+    # Joined here rather than fetched by the browser, so opening evidence
+    # stays one request and the header cannot render half-populated.
+    row = fetch_one(
+        """
+        SELECT ce.*, pk.picker_name, p.owner_name, p.house_number
+          FROM collection_events ce
+          LEFT JOIN pickers pk ON pk.picker_id = ce.picker_id
+          LEFT JOIN properties p ON p.property_id = ce.property_id
+         WHERE ce.event_id = %s
+        """,
+        (event_id,),
+    )
     if not row:
         raise HTTPException(status_code=404, detail=f"Unknown event {event_id}")
-    row["evidence"] = fetch_all(
-        "SELECT * FROM evidence WHERE event_id = %s ORDER BY captured_at", (event_id,)
-    )
+    # Through evidence_media, not a bare SELECT: the dashboard decides
+    # whether to render a player from `media_status`, and a row that omits
+    # it silently reads as "nothing to play" for a clip that is sitting on
+    # this disk.
+    row["evidence"] = evidence_media.enrich(
+        evidence_media.evidence_for_event(event_id))
     return row
 
 
@@ -278,9 +325,8 @@ def mark_non_segregated(event_id: str, req: NonSegregationRequest):
                 ),
             )
 
-    updated["evidence"] = fetch_all(
-        "SELECT * FROM evidence WHERE event_id = %s ORDER BY captured_at", (event_id,)
-    )
+    updated["evidence"] = evidence_media.enrich(
+        evidence_media.evidence_for_event(event_id))
     annotate_run(
         event_id=event_id,
         property_id=updated.get("property_id"),

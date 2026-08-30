@@ -26,8 +26,17 @@ ladder on each one would put a PostGIS query on the critical path of a
 sensor stream, and -- far worse -- would let a camera observation create a
 property association that WASTRAQ's own geometry never sanctioned.
 
-No writes to ``collection_events`` or ``evidence`` either. Those rows mean
-"a property was served"; nothing here knows that.
+No writes to ``collection_events`` or ``evidence`` from THIS module either.
+Those rows mean "a property was served"; nothing in the ingestion path knows
+that.
+
+What ingestion does do, once the raw row is committed, is hand the event to
+the episode engine (``app.episodes.engine``) via ``_dispatch_derived``. The
+engine is where a property may be decided - by PostGIS, against surveyed
+service zones. The ordering is deliberate and one-directional: the
+observation is durable BEFORE anything is derived from it, and a derivation
+that fails can be re-run from ``geovision_raw_events`` without the sender
+ever being told to retry.
 """
 
 from __future__ import annotations
@@ -41,7 +50,8 @@ from psycopg.types.json import Jsonb
 
 from ..database import fetch_all, fetch_one, get_conn
 from .schemas import (EvidenceReadyEvent, GeoVisionEvent, HeartbeatEvent,
-                      RfidTapEvent, TrackUpdateEvent, WorkerTrackBoundEvent)
+                      NonSegregationTriggerEvent, RfidTapEvent,
+                      TrackUpdateEvent, WorkerTrackBoundEvent)
 
 # In-process counters. Cheap, and they answer the question the database
 # cannot: how many events were REFUSED, which by definition were never
@@ -51,6 +61,11 @@ _counters: dict[str, int] = {
     "accepted": 0,
     "duplicates": 0,
     "rejected": 0,
+    # Derived work attempted AFTER the raw event was safely stored. Counted
+    # separately because a failure here is a degraded association, not a lost
+    # observation - the two must never look the same on the status page.
+    "derived_ok": 0,
+    "derived_failed": 0,
 }
 
 
@@ -159,13 +174,61 @@ def ingest(event: GeoVisionEvent, raw_payload: dict[str, Any]) -> dict[str, Any]
         conn.commit()
 
     _bump("accepted")
-    return {
+
+    derived = _dispatch_derived(event)
+
+    ack = {
         "status": "ACCEPTED",
         "event_id": event.event_id,
         "event_type": event.event_type,
         "duplicate": False,
         "received_at": now_utc(),
     }
+    # Echoed for every event EXCEPT the 5 Hz track stream, where an extra
+    # object per frame is bytes over site wifi for nobody to read.
+    if derived and event.event_type != "TRACK_UPDATE":
+        ack["derived"] = derived
+    return ack
+
+
+# ---------------------------------------------------------------------------
+# derived processing
+# ---------------------------------------------------------------------------
+#: Event types the episode engine has an opinion about. Everything else is
+#: stored and left alone.
+_DERIVED_TYPES = ("WORKER_TRACK_BOUND", "TRACK_UPDATE",
+                  "NON_SEGREGATION_TRIGGER", "EVIDENCE_READY")
+
+
+def _dispatch_derived(event: GeoVisionEvent) -> dict[str, Any] | None:
+    """Hand a stored event to the episode engine.
+
+    Runs AFTER the commit, and swallows everything. The contract with the
+    edge is about delivery: the event is on disk, so the ack is earned. If
+    the engine, PostGIS or the Windows mirror is having a bad day, that is a
+    WASTRAQ problem to be seen on ``/episodes/status`` - not a 5xx that makes
+    the sender retry an event we already hold.
+    """
+    if event.event_type not in _DERIVED_TYPES:
+        return None
+    try:
+        from ..episodes.engine import get_engine
+        engine = get_engine()
+        if isinstance(event, WorkerTrackBoundEvent):
+            result = engine.on_worker_bound(event)
+        elif isinstance(event, TrackUpdateEvent):
+            result = engine.on_track_update(event)
+        elif isinstance(event, NonSegregationTriggerEvent):
+            result = engine.on_non_segregation_trigger(event)
+        elif isinstance(event, EvidenceReadyEvent):
+            result = engine.on_evidence_ready(event)
+        else:
+            return None
+    except Exception as exc:  # noqa: BLE001
+        _bump("derived_failed")
+        return {"error": repr(exc)}
+    _bump("derived_ok")
+    return result
 
 
 def _touch_duplicate(source_id: str) -> None:
@@ -199,6 +262,13 @@ def _write_normalised(cur, event: GeoVisionEvent) -> None:
         _insert_clip(cur, event)
     elif isinstance(event, HeartbeatEvent):
         _upsert_heartbeat(cur, event)
+    elif isinstance(event, NonSegregationTriggerEvent):
+        # Deliberately NOT written here. The trigger's normalised row is
+        # written by the episode engine, inside the same call that decides
+        # what to do with it: the INSERT is the idempotency claim
+        # (trigger_id is the primary key), so writing it early would burn
+        # the claim before anything acted on it.
+        pass
 
 
 # --- TRACK_UPDATE ------------------------------------------------------------
@@ -333,13 +403,30 @@ def _insert_binding(cur, event: WorkerTrackBoundEvent) -> None:
 
 # --- EVIDENCE_READY ----------------------------------------------------------
 def _insert_clip(cur, event: EvidenceReadyEvent) -> None:
+    """Record the ANNOUNCEMENT. The bytes are pulled separately, later.
+
+    Retrieval metadata (``file_url``, ``content_type``, ``size_bytes``,
+    ``sha256``) is stored alongside the Windows path but never merged with
+    it: one says where the clip was recorded, the other says how to get a
+    copy, and conflating them is exactly the mistake that put a Windows
+    path in front of an operator.
+
+    ``ON CONFLICT DO NOTHING`` still applies, so a re-announcement under a
+    fresh envelope leaves the FIRST clip row untouched. That matters more
+    than it looks: the first row is the one the episode engine has already
+    linked evidence to, and overwriting it here would move the link.
+    """
     cur.execute(
         """
         INSERT INTO geovision_evidence_clips
             (event_id, source_id, session_id, event_time, clip_id, file_path,
+             file_url, content_type, size_bytes, sha256,
              clip_start, clip_end, frame_count, track_id, rfid_event_id)
         VALUES (%(event_id)s, %(source_id)s, %(session_id)s, %(event_time)s,
-                %(clip_id)s, %(file_path)s, %(clip_start)s, %(clip_end)s,
+                %(clip_id)s, %(file_path)s,
+                %(file_url)s, COALESCE(%(content_type)s, 'video/mp4'),
+                %(size_bytes)s, %(sha256)s,
+                %(clip_start)s, %(clip_end)s,
                 %(frame_count)s, %(track_id)s, %(rfid_event_id)s)
         -- (source_id, clip_id) is unique: the same clip re-announced under a
         -- new event_id is still one clip.
@@ -352,6 +439,10 @@ def _insert_clip(cur, event: EvidenceReadyEvent) -> None:
             "event_time": event.timestamp,
             "clip_id": event.clip_id,
             "file_path": event.file_path,
+            "file_url": getattr(event, "file_url", None),
+            "content_type": getattr(event, "content_type", None),
+            "size_bytes": getattr(event, "size_bytes", None),
+            "sha256": (getattr(event, "sha256", None) or "").lower() or None,
             "clip_start": event.start_time,
             "clip_end": event.end_time,
             "frame_count": event.frame_count,
@@ -457,10 +548,36 @@ def recent_clips(limit: int = 10) -> list[dict[str, Any]]:
     return fetch_all(
         """
         SELECT event_id, source_id, session_id, event_time, clip_id, file_path,
-               clip_start, clip_end, frame_count, track_id, rfid_event_id, fetched
+               clip_start, clip_end, frame_count, track_id, rfid_event_id, fetched,
+               file_url, content_type, size_bytes, local_path, local_bytes,
+               fetch_status, fetch_attempts, fetch_error, last_fetch_at,
+               episode_id, linked_evidence_id
         FROM geovision_evidence_clips
         ORDER BY event_time DESC
         LIMIT %s
+        """,
+        (limit,),
+    )
+
+
+def recent_triggers(limit: int = 10) -> list[dict[str, Any]]:
+    """Recent second-tap signals and what WASTRAQ did with each.
+
+    ``resolved_property_id`` is joined in from the EPISODE, never from the
+    trigger row - the trigger has no property column and never will.
+    """
+    return fetch_all(
+        """
+        SELECT t.trigger_id, t.event_id, t.source_id, t.session_id, t.event_time,
+               t.claimed_episode_id, t.collector_id, t.rfid_uid, t.track_id,
+               t.trigger_status, t.edge_duplicate, t.rfid_event_id,
+               t.applied, t.applied_episode_id, t.resolution,
+               t.resolution_detail, t.needs_review,
+               ep.property_id AS resolved_property_id
+          FROM geovision_non_segregation_triggers t
+          LEFT JOIN collection_episodes ep ON ep.episode_id = t.applied_episode_id
+         ORDER BY t.event_time DESC
+         LIMIT %s
         """,
         (limit,),
     )
@@ -475,6 +592,16 @@ def totals() -> dict[str, Any]:
           (SELECT count(*) FROM geovision_rfid_taps)         AS rfid_taps,
           (SELECT count(*) FROM geovision_worker_bindings)   AS worker_bindings,
           (SELECT count(*) FROM geovision_evidence_clips)    AS evidence_clips,
+          (SELECT count(*) FROM geovision_evidence_clips
+            WHERE fetch_status = 'STORED')                   AS evidence_clips_stored,
+          (SELECT count(*) FROM geovision_evidence_clips
+            WHERE fetch_status <> 'STORED')                  AS evidence_clips_not_held,
+          (SELECT count(*) FROM geovision_non_segregation_triggers)
+                                                             AS non_segregation_triggers,
+          (SELECT count(*) FROM geovision_non_segregation_triggers WHERE applied)
+                                                             AS triggers_applied,
+          (SELECT count(*) FROM geovision_non_segregation_triggers WHERE needs_review)
+                                                             AS triggers_needing_review,
           (SELECT count(*) FROM geovision_devices)           AS devices,
           (SELECT max(received_at) FROM geovision_raw_events) AS last_received_at
         """
