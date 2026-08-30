@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+
+# IDE
+.vscode/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+
+# Generated files
+uploads/
+output/
+recordings/
+frames/
+
+# Large media
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# YOLO/model files
+*.pt
+*.onnx
+
+# OS
+.DS_Store
+Thumbs.db
+
+# GeoVision evidence clips (local footage, never committed)
+evidence_clips/

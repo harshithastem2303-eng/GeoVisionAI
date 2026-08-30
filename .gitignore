@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+*.local
+
+# IDE
+.vscode/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log
+logs/
+
+# Generated files
+uploads/
+output/
+recordings/
+frames/
+
+# Large media
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# YOLO/model files
+*.pt
+*.onnx
+*.pth
+*.engine
+backend/models/
+backend/weights/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js
+node_modules/
+dist/
+dist-ssr/
+
+# GeoVision generated data
+captured_frames/
+runs/
+
+# GeoVision evidence clips (local footage, never committed)
+evidence_clips/
+
+# Private imagery - photographs of real people, never commit
+person_crops/
+backend/person_crops/
+dataset/
+backend/dataset/
